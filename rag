@@ -1,1 +1,140 @@
+import os
+import pickle
+import numpy as np
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from openai import OpenAI
+import faiss
 
+# Ensure your OpenAI API key is set as an environment variable
+load_dotenv(".env", override=True)
+
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("OpenAI API key not found. Please set it in the .env file.")
+
+client = OpenAI(api_key=api_key)
+
+# File paths for saving embeddings and FAISS index
+pdf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hp_azkaban.pdf")
+faiss_index_path = "faiss_index.bin"
+embeddings_path = "embeddings.pkl"
+documents_path = "documents.pkl"
+
+
+def get_embedding(text, model="text-embedding-3-small"):
+    text = text.replace("\n", " ")
+    return client.embeddings.create(input=[text], model=model).data[0].embedding
+
+
+# Step 1: Load the PDF
+def load_pdf(file_path):
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text()
+    return text
+
+
+# Step 2: Split the text into manageable chunks
+def split_text(text, chunk_size=1000, chunk_overlap=100):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start += chunk_size - chunk_overlap
+    return chunks
+
+
+# Step 3: Create embeddings
+def create_embeddings(text_chunks, model="text-embedding-ada-002"):
+    embeddings = []
+    for chunk in text_chunks:
+        embedding = get_embedding(chunk)
+        embeddings.append(embedding)
+    return embeddings
+
+
+# Step 4: Save and load FAISS index and embeddings
+def save_faiss_index(index, path):
+    faiss.write_index(index, path)
+
+
+def load_faiss_index(path):
+    return faiss.read_index(path)
+
+
+def save_embeddings(embeddings, documents, emb_path, doc_path):
+    with open(emb_path, "wb") as emb_file:
+        pickle.dump(embeddings, emb_file)
+    with open(doc_path, "wb") as doc_file:
+        pickle.dump(documents, doc_file)
+
+
+def load_embeddings(emb_path, doc_path):
+    with open(emb_path, "rb") as emb_file:
+        embeddings = pickle.load(emb_file)
+    with open(doc_path, "rb") as doc_file:
+        documents = pickle.load(doc_file)
+    return embeddings, documents
+
+
+# Check if FAISS index and embeddings exist
+if os.path.exists(faiss_index_path) and os.path.exists(embeddings_path) and os.path.exists(documents_path):
+    print("Loading FAISS index and embeddings from disk...")
+    index = load_faiss_index(faiss_index_path)
+    embeddings, split_docs = load_embeddings(embeddings_path, documents_path)
+    embedding_array = np.array(embeddings, dtype=np.float32)  # Ensure embeddings are NumPy array
+else:
+    print("Processing PDF and creating FAISS index...")
+    document_text = load_pdf(pdf_path)
+    split_docs = split_text(document_text)
+    embeddings = create_embeddings(split_docs)
+    embedding_array = np.array(embeddings, dtype=np.float32)  # Ensure embeddings are NumPy array
+
+    # Create FAISS index
+    dimension = embedding_array.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embedding_array)
+
+    # Save FAISS index and embeddings
+    save_faiss_index(index, faiss_index_path)
+    save_embeddings(embeddings, split_docs, embeddings_path, documents_path)
+    print("FAISS index and embeddings saved to disk.")
+
+
+
+def retrieve_relevant_chunks(query, index, text_chunks, top_k=5, model="text-embedding-ada-002"):
+    query_embedding = np.array([get_embedding(query)], dtype=np.float32)
+    distances, indices = index.search(query_embedding, top_k)
+    results = [text_chunks[i] for i in indices[0]]
+    return results
+
+
+def chat_with_gpt(prompt, model="gpt-3.5-turbo"):
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content.strip()
+
+
+if __name__ == "__main__":
+    # Step 6: Chat with the system
+    chat_history = []
+
+    while True:
+        query = input("Enter your question (or type 'exit' to quit): ")
+        if query.lower() == "exit":
+            break
+
+        # Retrieve relevant chunks
+        relevant_chunks = retrieve_relevant_chunks(query, index, split_docs)
+        context = "\n".join(relevant_chunks)
+        conversation_prompt = f"Context:\n{context}\n\nQuestion: {query}\n\nAnswer:"
+        response = chat_with_gpt(conversation_prompt)
+
+        print("\nGPT Response:", response)
+
+        chat_history.append((query, response))
